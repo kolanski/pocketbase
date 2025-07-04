@@ -38,6 +38,7 @@
             timeout: 30,
             triggers: {},
             env_vars: {},
+            contentType: "auto",
             ...functionToEdit,
         };
 
@@ -251,6 +252,25 @@
                             max="300"
                             bind:value={func.timeout}
                         />
+                    </Field>
+                </div>
+
+                <div class="col-6">
+                    <Field class="form-field" name="contentType" let:uniqueId>
+                        <label for={uniqueId}>Default Content Type</label>
+                        <select id={uniqueId} bind:value={func.contentType}>
+                            <option value="auto">Auto-detect</option>
+                            <option value="text/plain">Plain Text</option>
+                            <option value="text/html">HTML</option>
+                            <option value="application/json">JSON</option>
+                            <option value="text/css">CSS</option>
+                            <option value="application/javascript">JavaScript</option>
+                            <option value="application/xml">XML</option>
+                            <option value="text/xml">XML (text)</option>
+                        </select>
+                        <div class="help-text">
+                            Sets the Content-Type header when not explicitly specified in function response
+                        </div>
                     </Field>
                 </div>
 

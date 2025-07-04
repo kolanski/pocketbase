@@ -458,8 +458,20 @@ func (p *LambdaFunctionPlugin) createHTTPHandler(functionID string) func(*core.R
 					// Check if Content-Type header is set to determine response type
 					contentType := e.Response.Header().Get("Content-Type")
 					if contentType == "" {
-						// Default to text/plain for string responses
-						contentType = "text/plain"
+						// Use function's configured content type as default
+						functionRecord, err := p.app.FindRecordById(core.CollectionNameLambdaFunctions, functionID)
+						if err == nil {
+							configuredContentType := functionRecord.GetString("contentType")
+							if configuredContentType != "" && configuredContentType != "auto" {
+								contentType = configuredContentType
+							} else {
+								// Intelligent content type detection for "auto" mode
+								contentType = p.detectContentType(bodyStr)
+							}
+						} else {
+							// Fallback to text/plain if we can't find the function record
+							contentType = "text/plain"
+						}
 						e.Response.Header().Set("Content-Type", contentType)
 					}
 					
@@ -480,6 +492,49 @@ func (p *LambdaFunctionPlugin) createHTTPHandler(functionID string) func(*core.R
 		p.app.Logger().Info("Using default JSON response")
 		return e.JSON(http.StatusOK, result.Output)
 	}
+}
+
+// detectContentType intelligently detects content type based on content
+func (p *LambdaFunctionPlugin) detectContentType(content string) string {
+	content = strings.TrimSpace(content)
+	
+	// Check for HTML
+	if strings.HasPrefix(content, "<!DOCTYPE html") || 
+	   strings.HasPrefix(content, "<html") || 
+	   strings.Contains(content, "<body") ||
+	   strings.Contains(content, "<div") ||
+	   strings.Contains(content, "<span") {
+		return "text/html"
+	}
+	
+	// Check for JSON
+	if (strings.HasPrefix(content, "{") && strings.HasSuffix(content, "}")) ||
+	   (strings.HasPrefix(content, "[") && strings.HasSuffix(content, "]")) {
+		return "application/json"
+	}
+	
+	// Check for XML
+	if strings.HasPrefix(content, "<?xml") || 
+	   (strings.HasPrefix(content, "<") && strings.Contains(content, ">")) {
+		return "application/xml"
+	}
+	
+	// Check for CSS
+	if strings.Contains(content, "{") && strings.Contains(content, "}") && 
+	   (strings.Contains(content, "color:") || strings.Contains(content, "font-") || 
+	    strings.Contains(content, "margin:") || strings.Contains(content, "padding:")) {
+		return "text/css"
+	}
+	
+	// Check for JavaScript
+	if strings.Contains(content, "function") || strings.Contains(content, "var ") ||
+	   strings.Contains(content, "let ") || strings.Contains(content, "const ") ||
+	   strings.Contains(content, "console.log") || strings.Contains(content, "document.") {
+		return "application/javascript"
+	}
+	
+	// Default to plain text
+	return "text/plain"
 }
 
 // executeFunctionForDBEvent executes functions triggered by database events
@@ -550,27 +605,26 @@ func (p *LambdaFunctionPlugin) executeFunction(ctx *LambdaFunctionExecutionConte
 
 	var result *LambdaFunctionExecutionResult
 
-	// Execute with VM from pool
-	p.executors.run(func(vm *goja.Runtime) error {
-		// Set execution context
-		p.setExecutionContext(vm, ctx, function)
+	// Execute with a fresh VM for true isolation
+	// Instead of using the pool (which reuses VMs), create a fresh VM for each execution
+	vm := p.createVM()
+	
+	// Set execution context
+	p.setExecutionContext(vm, ctx, function)
 
-		// Execute with timeout
-		execCtx, cancel := context.WithTimeout(context.Background(), p.config.MaxExecutionTime)
-		defer cancel()
+	// Execute with timeout
+	execCtx, cancel := context.WithTimeout(context.Background(), p.config.MaxExecutionTime)
+	defer cancel()
 
-		// Execute the function
-		output, err := p.executeWithContext(execCtx, vm, function.GetString("code"))
-		
-		result = &LambdaFunctionExecutionResult{
-			Success:  err == nil,
-			Output:   output,
-			Error:    p.formatError(err),
-			Duration: time.Since(ctx.StartTime),
-		}
-		
-		return nil
-	})
+	// Execute the function
+	output, err := p.executeWithContext(execCtx, vm, function.GetString("code"))
+	
+	result = &LambdaFunctionExecutionResult{
+		Success:  err == nil,
+		Output:   output,
+		Error:    p.formatError(err),
+		Duration: time.Since(ctx.StartTime),
+	}
 
 	return result
 }
@@ -618,6 +672,9 @@ func (p *LambdaFunctionPlugin) executeWithContext(ctx context.Context, vm *goja.
 
 	go func() {
 		defer close(done)
+		
+		// Execute the code directly in a fresh VM
+		// Each execution gets a completely isolated environment
 		result, err = vm.RunString(code)
 	}()
 
@@ -649,6 +706,47 @@ func (p *LambdaFunctionPlugin) formatError(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// clearUserVariables clears user-defined variables from the VM while preserving PocketBase bindings
+func (p *LambdaFunctionPlugin) clearUserVariables(vm *goja.Runtime) {
+	// Instead of trying to selectively clear variables, which is complex and error-prone,
+	// let's use a more direct approach: run code to delete user-defined variables
+	
+	// Get list of all current global properties
+	_, err := vm.RunString(`
+		(function() {
+			// List of system properties to preserve
+			const preserve = new Set([
+				'$app', '$template', 'console', 'require', 'process', 'Buffer', 'global',
+				'Object', 'Array', 'String', 'Number', 'Boolean', 'Date', 'Math', 'JSON',
+				'RegExp', 'Error', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError',
+				'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'encodeURI', 'decodeURI',
+				'encodeURIComponent', 'decodeURIComponent', 'escape', 'unescape', 'eval',
+				'undefined', 'NaN', 'Infinity', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'
+			]);
+			
+			// Get all property names from global object
+			const globalObj = (function() { return this; })();
+			const allKeys = Object.getOwnPropertyNames(globalObj);
+			
+			// Delete user-defined properties
+			for (const key of allKeys) {
+				if (!preserve.has(key) && !key.startsWith('$')) {
+					try {
+						delete globalObj[key];
+					} catch (e) {
+						// Some properties might not be deletable, ignore errors
+					}
+				}
+			}
+		})();
+	`)
+	
+	if err != nil {
+		// If clearing fails, log it but don't fail the execution
+		// This is a best-effort cleanup
+	}
 }
 
 // Function lifecycle handlers

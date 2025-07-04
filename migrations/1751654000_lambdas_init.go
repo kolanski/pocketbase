@@ -64,6 +64,12 @@ func init() {
 			System: true,
 		})
 
+		collection.Fields.Add(&core.SelectField{
+			Name:    "contentType",
+			System:  true,
+			Values:  []string{"auto", "text/plain", "text/html", "application/json", "text/css", "application/javascript", "application/xml", "text/xml"},
+		})
+
 		collection.Fields.Add(&core.AutodateField{
 			Name:     "created",
 			System:   true,

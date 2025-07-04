@@ -22,6 +22,7 @@ type LambdaFunctionCreateRequest struct {
 	Triggers    map[string]interface{} `json:"triggers" form:"triggers"`
 	EnvVars     map[string]string      `json:"env_vars" form:"env_vars"`
 	Description string                 `json:"description" form:"description"`
+	ContentType string                 `json:"contentType" form:"contentType"`
 }
 
 // LambdaFunctionUpdateRequest represents the request for updating a lambda function
@@ -33,6 +34,7 @@ type LambdaFunctionUpdateRequest struct {
 	Triggers    map[string]interface{} `json:"triggers" form:"triggers"`
 	EnvVars     map[string]string      `json:"env_vars" form:"env_vars"`
 	Description string                 `json:"description" form:"description"`
+	ContentType string                 `json:"contentType" form:"contentType"`
 }
 
 // BindLambdaFunctionRoutes binds the lambda function API routes
@@ -132,6 +134,7 @@ func (api *lambdaFunctionAPI) create(e *core.RequestEvent) error {
 	record.Set("enabled", form.Enabled)
 	record.Set("timeout", timeoutMs)
 	record.Set("description", form.Description)
+	record.Set("contentType", form.ContentType)
 
 	// Convert triggers to JSON
 	triggersJSON, _ := json.Marshal(form.Triggers)
@@ -151,6 +154,7 @@ func (api *lambdaFunctionAPI) create(e *core.RequestEvent) error {
 		"enabled":     record.GetBool("enabled"),
 		"timeout":     record.GetInt("timeout") / 1000, // Convert ms to seconds for display
 		"description": record.GetString("description"),
+		"contentType": record.GetString("contentType"),
 		"created":     record.GetDateTime("created"),
 		"updated":     record.GetDateTime("updated"),
 	})
@@ -172,6 +176,7 @@ func (api *lambdaFunctionAPI) view(e *core.RequestEvent) error {
 		"triggers":    record.GetString("triggers"),
 		"env_vars":    record.GetString("envVars"),
 		"description": record.GetString("description"),
+		"contentType": record.GetString("contentType"),
 		"created":     record.GetDateTime("created"),
 		"updated":     record.GetDateTime("updated"),
 	})
@@ -218,6 +223,10 @@ func (api *lambdaFunctionAPI) update(e *core.RequestEvent) error {
 		record.Set("description", form.Description)
 	}
 
+	if form.ContentType != "" {
+		record.Set("contentType", form.ContentType)
+	}
+
 	if form.Triggers != nil {
 		if err := validateTriggers(form.Triggers); err != nil {
 			return e.BadRequestError("Invalid trigger configuration", err)
@@ -241,6 +250,7 @@ func (api *lambdaFunctionAPI) update(e *core.RequestEvent) error {
 		"enabled":     record.GetBool("enabled"),
 		"timeout":     record.GetInt("timeout") / 1000, // Convert ms to seconds for display
 		"description": record.GetString("description"),
+		"contentType": record.GetString("contentType"),
 		"created":     record.GetDateTime("created"),
 		"updated":     record.GetDateTime("updated"),
 	})
