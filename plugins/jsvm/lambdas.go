@@ -155,7 +155,100 @@ func (p *LambdaFunctionPlugin) createVM() *goja.Runtime {
 	mailsBinds(vm)
 
 	// Add lambda function specific bindings
-	vm.Set("$app", p.app)
+	// Create a JavaScript-compatible $app object with the same methods as manual execution
+	pbApp := vm.NewObject()
+	
+	// Add findRecordById function
+	pbApp.Set("findRecordById", func(collection, id string) interface{} {
+		record, err := p.app.FindRecordById(collection, id)
+		if err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		return p.recordToMap(record)
+	})
+	
+	// Add findRecordByFilter function
+	pbApp.Set("findRecordByFilter", func(collection, filter string) interface{} {
+		record, err := p.app.FindFirstRecordByFilter(collection, filter)
+		if err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		return p.recordToMap(record)
+	})
+	
+	// Add findRecords function
+	pbApp.Set("findRecords", func(collection string, args ...interface{}) interface{} {
+		var filter string
+		var sort string = "-created"
+		var limit int = 30
+		var offset int = 0
+		
+		if len(args) > 0 {
+			if f, ok := args[0].(string); ok {
+				filter = f
+			}
+		}
+		if len(args) > 1 {
+			if s, ok := args[1].(string); ok {
+				sort = s
+			}
+		}
+		if len(args) > 2 {
+			if l, ok := args[2].(int64); ok {
+				limit = int(l)
+			}
+		}
+		if len(args) > 3 {
+			if o, ok := args[3].(int64); ok {
+				offset = int(o)
+			}
+		}
+		
+		records, err := p.app.FindRecordsByFilter(collection, filter, sort, limit, offset)
+		if err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		
+		result := make([]interface{}, len(records))
+		for i, record := range records {
+			result[i] = p.recordToMap(record)
+		}
+		return result
+	})
+	
+	// Add findRecordsByFilter function (the one used in your lambda)
+	pbApp.Set("findRecordsByFilter", func(collection, filter, sort string, limit, offset int) interface{} {
+		records, err := p.app.FindRecordsByFilter(collection, filter, sort, limit, offset)
+		if err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		
+		result := make([]interface{}, len(records))
+		for i, record := range records {
+			result[i] = p.recordToMap(record)
+		}
+		return result
+	})
+	
+	// Add dao() method that returns an object with findRecordsByFilter
+	dao := vm.NewObject()
+	dao.Set("findRecordsByFilter", func(collection, filter, sort string, limit, offset int) interface{} {
+		records, err := p.app.FindRecordsByFilter(collection, filter, sort, limit, offset)
+		if err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		
+		result := make([]interface{}, len(records))
+		for i, record := range records {
+			result[i] = p.recordToMap(record)
+		}
+		return result
+	})
+	pbApp.Set("dao", func() interface{} {
+		return dao
+	})
+	
+	vm.Set("$app", pbApp)
 	vm.Set("$template", p.templateRegistry)
 
 	// Custom initialization
@@ -470,8 +563,14 @@ func (p *LambdaFunctionPlugin) createHTTPHandler(functionID string) func(*core.R
 							}
 						} else {
 							// Fallback to text/plain if we can't find the function record
-							contentType = "text/plain"
+							contentType = "text/html; charset=utf-8"
 						}
+						
+						// Ensure UTF-8 charset is included for text responses
+						if strings.HasPrefix(contentType, "text/") && !strings.Contains(contentType, "charset") {
+							contentType += "; charset=utf-8"
+						}
+						
 						e.Response.Header().Set("Content-Type", contentType)
 					}
 					
@@ -807,4 +906,25 @@ func (p *LambdaFunctionPlugin) handleFunctionDeleted(record *core.Record) error 
 	}
 
 	return nil
+}
+
+// recordToMap converts a PocketBase record to a JavaScript-compatible map
+func (p *LambdaFunctionPlugin) recordToMap(record *core.Record) map[string]interface{} {
+	result := map[string]interface{}{
+		"id":      record.Id,
+		"created": record.GetDateTime("created"),
+		"updated": record.GetDateTime("updated"),
+	}
+	
+	// Add all field values using get() method for compatibility
+	for name := range record.Collection().Fields.AsMap() {
+		result[name] = record.Get(name)
+	}
+	
+	// Add get() method for JavaScript compatibility
+	result["get"] = func(fieldName string) interface{} {
+		return record.Get(fieldName)
+	}
+	
+	return result
 }
