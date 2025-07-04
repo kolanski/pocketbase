@@ -16,6 +16,7 @@ import (
 	"github.com/dop251/goja_nodejs/require"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/cron"
+	"github.com/pocketbase/pocketbase/tools/router"
 	"github.com/pocketbase/pocketbase/tools/template"
 )
 
@@ -41,6 +42,7 @@ type LambdaFunctionPlugin struct {
 	config        LambdaFunctionPluginConfig
 	executors     *vmsPool
 	scheduler     *cron.Cron
+	router        *router.Router[*core.RequestEvent]
 	httpRoutes    sync.Map // map[string]*LambdaFunctionHTTPRoute
 	dbTriggers    sync.Map // map[string][]*LambdaFunctionDBTrigger
 	cronJobs      sync.Map // map[string]*LambdaFunctionCronJob
@@ -119,7 +121,12 @@ func RegisterLambdaFunctionPlugin(app core.App, config LambdaFunctionPluginConfi
 		if err := e.Next(); err != nil {
 			return err
 		}
-		return plugin.loadLambdaFunctions()
+		if err := plugin.loadLambdaFunctions(); err != nil {
+			return err
+		}
+		// Register HTTP routes after functions are loaded
+		plugin.registerHTTPRoutes()
+		return nil
 	})
 
 	return plugin, nil
@@ -161,9 +168,11 @@ func (p *LambdaFunctionPlugin) createVM() *goja.Runtime {
 
 // registerLifecycleHooks registers the necessary app lifecycle hooks
 func (p *LambdaFunctionPlugin) registerLifecycleHooks() {
-	// Register HTTP routes on serve
+	// Store the router for later use and register routes
 	p.app.OnServe().BindFunc(func(e *core.ServeEvent) error {
-		p.registerHTTPRoutes(e)
+		p.router = e.Router
+		// Register HTTP routes immediately when router is available
+		p.registerHTTPRoutes()
 		return e.Next()
 	})
 
@@ -220,7 +229,10 @@ func (p *LambdaFunctionPlugin) loadLambdaFunctions() error {
 		return fmt.Errorf("failed to load lambda functions: %w", err)
 	}
 
+	p.app.Logger().Info("Loading lambda functions", "count", len(functions))
+
 	for _, function := range functions {
+		p.app.Logger().Info("Registering lambda function", "name", function.GetString("name"), "id", function.Id)
 		if err := p.registerFunction(function); err != nil {
 			// Log error but continue loading other functions
 			p.app.Logger().Error("Failed to register lambda function", "function", function.GetString("name"), "error", err)
@@ -233,26 +245,34 @@ func (p *LambdaFunctionPlugin) loadLambdaFunctions() error {
 // registerFunction registers triggers for a specific lambda function
 func (p *LambdaFunctionPlugin) registerFunction(function *core.Record) error {
 	if !function.GetBool("enabled") {
+		p.app.Logger().Debug("Skipping disabled function", "name", function.GetString("name"))
 		return nil
 	}
 
 	functionID := function.Id
 	triggers := function.GetString("triggers")
+	
+	p.app.Logger().Info("Processing triggers for function", "name", function.GetString("name"), "triggers", triggers)
 
 	var triggerConfig map[string]interface{}
 	if err := json.Unmarshal([]byte(triggers), &triggerConfig); err != nil {
+		p.app.Logger().Error("Invalid trigger configuration", "function", function.GetString("name"), "error", err, "triggers", triggers)
 		return fmt.Errorf("invalid trigger configuration: %w", err)
 	}
 
 	// Register HTTP triggers
 	if httpTriggers, ok := triggerConfig["http"].([]interface{}); ok {
+		p.app.Logger().Info("Found HTTP triggers", "count", len(httpTriggers), "function", function.GetString("name"))
 		for _, trigger := range httpTriggers {
 			if httpTrigger, ok := trigger.(map[string]interface{}); ok {
 				method := strings.ToUpper(httpTrigger["method"].(string))
 				path := httpTrigger["path"].(string)
+				p.app.Logger().Info("Registering HTTP trigger", "method", method, "path", path, "function", function.GetString("name"))
 				p.registerHTTPTrigger(functionID, method, path)
 			}
 		}
+	} else {
+		p.app.Logger().Debug("No HTTP triggers found", "function", function.GetString("name"))
 	}
 
 	// Register database triggers
@@ -322,11 +342,32 @@ func (p *LambdaFunctionPlugin) registerCronTrigger(functionID, schedule string) 
 }
 
 // registerHTTPRoutes registers HTTP routes with the PocketBase router
-func (p *LambdaFunctionPlugin) registerHTTPRoutes(e *core.ServeEvent) {
+func (p *LambdaFunctionPlugin) registerHTTPRoutes() {
+	if p.router == nil {
+		p.app.Logger().Debug("Router not available yet, skipping HTTP route registration")
+		return
+	}
+	
 	p.httpRoutes.Range(func(key, value interface{}) bool {
 		route := value.(*LambdaFunctionHTTPRoute)
-		fullPath := "/api/functions" + route.Path
-		e.Router.Route(route.Method, fullPath, route.Handler)
+		
+		// Support both prefixed and direct routes
+		// If path starts with /api/, use as-is
+		// Otherwise, use direct path for custom routes like /test, /ui
+		var fullPath string
+		if strings.HasPrefix(route.Path, "/api/") {
+			fullPath = route.Path
+		} else {
+			// Custom routes without prefix
+			fullPath = route.Path
+		}
+		
+		p.app.Logger().Info("Registering lambda HTTP route", 
+			"method", route.Method, 
+			"path", fullPath, 
+			"function", route.FunctionID)
+		
+		p.router.Route(route.Method, fullPath, route.Handler)
 		return true
 	})
 }
@@ -376,24 +417,67 @@ func (p *LambdaFunctionPlugin) createHTTPHandler(functionID string) func(*core.R
 			return e.InternalServerError("Lambda function execution failed", fmt.Errorf(result.Error))
 		}
 
-		// If the function returned a response object, handle it
-		if response, ok := result.Output.(map[string]interface{}); ok {
-			if status, ok := response["status"].(float64); ok {
-				e.Response.WriteHeader(int(status))
+		p.app.Logger().Info("Lambda function result", 
+			"type", fmt.Sprintf("%T", result.Output), 
+			"value", fmt.Sprintf("%+v", result.Output))
+
+		// Convert goja.Object to Go map
+		var responseMap map[string]interface{}
+		
+		// If it's a goja.Object, convert it to a map
+		if gojaObj, ok := result.Output.(*goja.Object); ok {
+			if exported := gojaObj.Export(); exported != nil {
+				if convertedMap, ok := exported.(map[string]interface{}); ok {
+					responseMap = convertedMap
+					p.app.Logger().Info("Converted goja.Object to map", "map", responseMap)
+				}
 			}
-			if headers, ok := response["headers"].(map[string]interface{}); ok {
+		} else if directMap, ok := result.Output.(map[string]interface{}); ok {
+			responseMap = directMap
+		}
+
+		// If the function returned a response object, handle it
+		if responseMap != nil {
+			p.app.Logger().Info("Processing response object", "response", responseMap)
+			// Set status code
+			status := http.StatusOK
+			if statusValue, ok := responseMap["status"].(float64); ok {
+				status = int(statusValue)
+			}
+			
+			// Set headers
+			if headers, ok := responseMap["headers"].(map[string]interface{}); ok {
 				for key, value := range headers {
 					e.Response.Header().Set(key, fmt.Sprintf("%v", value))
 				}
 			}
-			if body, ok := response["body"]; ok {
+			
+			// Handle response body
+			if body, ok := responseMap["body"]; ok {
 				if bodyStr, ok := body.(string); ok {
-					return e.String(http.StatusOK, bodyStr)
+					// Check if Content-Type header is set to determine response type
+					contentType := e.Response.Header().Get("Content-Type")
+					if contentType == "" {
+						// Default to text/plain for string responses
+						contentType = "text/plain"
+						e.Response.Header().Set("Content-Type", contentType)
+					}
+					
+					e.Response.WriteHeader(status)
+					e.Response.Write([]byte(bodyStr))
+					return nil
 				}
-				return e.JSON(http.StatusOK, body)
+				// Non-string body, return as JSON
+				return e.JSON(status, body)
 			}
+			
+			// No body, just return status
+			e.Response.WriteHeader(status)
+			return nil
 		}
 
+		// Default: return function output as JSON
+		p.app.Logger().Info("Using default JSON response")
 		return e.JSON(http.StatusOK, result.Output)
 	}
 }
@@ -569,14 +653,24 @@ func (p *LambdaFunctionPlugin) formatError(err error) string {
 
 // Function lifecycle handlers
 func (p *LambdaFunctionPlugin) handleFunctionCreated(record *core.Record) error {
-	return p.registerFunction(record)
+	if err := p.registerFunction(record); err != nil {
+		return err
+	}
+	// Re-register HTTP routes to include new function routes
+	p.registerHTTPRoutes()
+	return nil
 }
 
 func (p *LambdaFunctionPlugin) handleFunctionUpdated(record *core.Record) error {
 	// Remove old registrations
 	p.handleFunctionDeleted(record)
 	// Register new ones
-	return p.registerFunction(record)
+	if err := p.registerFunction(record); err != nil {
+		return err
+	}
+	// Re-register HTTP routes to include updated function routes
+	p.registerHTTPRoutes()
+	return nil
 }
 
 func (p *LambdaFunctionPlugin) handleFunctionDeleted(record *core.Record) error {
